@@ -135,6 +135,8 @@ class CustomEvalSaveCallback(TrainerCallback):
                 control.should_training_stop = True
                 # Save a checkpoint at the checking step so the final run can resume
                 control.should_save = True
+                # Run a quick eval at checking_step so LR selection uses dev loss (better proxy for final quality).
+                control.should_evaluate = True
                 # Save a stable loss signal for LR selection
                 current_loss = self._smoothed_train_loss(state, window=5)
                 if current_loss is None and state.log_history:
@@ -167,38 +169,11 @@ class CustomEvalSaveCallback(TrainerCallback):
             my_state["train"]["current_loss"] = current_loss
                 
             control.should_training_stop = True
-
-            # Check if current_loss > current min_loss --> do not save to save time and space
-            # 
-            # if my_state["train"]["current_loss"] > current_min_loss:
-            #     print(f"Current loss: {my_state['train']['current_loss']} is greater than the current min_loss: {current_min_loss}, do not save the checkpoint", flush=True)
-            #     control.should_save = False
-            # check if this is the last run and the current_loss is the lowest --> keep running the training
-            current_is_better = False
-            try:
-                current_min_loss = min([run["current_loss"] for run in my_state.get("runs", []) if run.get("current_loss") is not None])
-            except ValueError:
-                current_min_loss = None
-            if current_min_loss is None:
-                current_is_better = True
-            elif current_loss is not None and current_loss <= current_min_loss:
-                current_is_better = True
-
-            # Only save checkpoint if this run improved on the best so far (saves disk/time).
-            if current_is_better:
-                control.should_save = True
-                my_state["train"]["checkpoint_dir"] = os.path.join(
-                    self.output_dir, f"checkpoint-{state.global_step}"
-                )
-            else:
-                control.should_save = False
-                my_state["train"]["checkpoint_dir"] = None
-                    
-            # If this is the final warmup run and it's the best so far, continue training to completion.
-            is_last_run = (len(my_state.get("runs", [])) + 1) == my_state.get("next_runs", 0)
-            if is_last_run and current_is_better:
-                control.should_training_stop = False
-                my_state["mode"] = "finish"
+            # Run eval at checking_step so selection uses dev loss (on_evaluate will overwrite current_loss).
+            control.should_evaluate = True
+            # Decide whether to save/continue based on *eval* loss in on_evaluate.
+            control.should_save = False
+            my_state["train"]["checkpoint_dir"] = None
             
             if is_main_process(LOCAL_RANK):
                 set_state(my_state)
@@ -229,6 +204,47 @@ class CustomEvalSaveCallback(TrainerCallback):
         if state.global_step < 2:
             return 
         print(f"GO INTO CUSTOMIZED EVALUATE AT STEP: {state.global_step}", flush=True)
+
+        # If we're in LR-checking mode, use dev eval loss as the selection metric.
+        # This is a much better proxy for final eval quality than raw training loss.
+        if state.global_step == self.checking_step and self.checking_mode in ("first_time", "second_time"):
+            my_state = get_state()
+            # Fall back to existing value if eval_loss is missing for some reason.
+            if eval_loss is not None:
+                my_state.setdefault("train", {})
+                my_state["train"]["current_loss"] = eval_loss
+
+            if self.checking_mode == "second_time":
+                # In second_time, use eval_loss to decide whether this LR is the best so far.
+                prev_losses = [
+                    run.get("current_loss")
+                    for run in my_state.get("runs", [])
+                    if run.get("current_loss") is not None
+                ]
+                prev_best = min(prev_losses) if prev_losses else None
+                is_better = False
+                if eval_loss is None:
+                    # If eval didn't produce a metric, prefer saving so we still have a resumable checkpoint.
+                    is_better = True
+                elif prev_best is None or eval_loss <= prev_best:
+                    is_better = True
+
+                # Save checkpoint only if this LR is best so far (saves disk/time).
+                if is_better:
+                    control.should_save = True
+                    my_state["train"]["checkpoint_dir"] = os.path.join(
+                        self.output_dir, f"checkpoint-{state.global_step}"
+                    )
+
+                # If this is the final warmup run and it's best by eval loss, continue to completion.
+                is_last_run = (len(my_state.get("runs", [])) + 1) == my_state.get("next_runs", 0)
+                if is_last_run and is_better:
+                    control.should_training_stop = False
+                    my_state["mode"] = "finish"
+
+            if is_main_process(LOCAL_RANK):
+                set_state(my_state)
+
         if self.best_checkpoint_info is None or eval_loss < self.best_checkpoint_info["loss"]:
             print(f"Updating the best checkpoint info at step: {state.global_step} with eval_loss: {eval_loss}", flush=True)
             self.best_checkpoint_info = {

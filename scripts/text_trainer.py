@@ -175,6 +175,7 @@ def is_openai_model(model_name: str) -> bool:
 
 
 OOM_ERROR = "torch.OutOfMemoryError: CUDA out of memory"
+OOM_ERROR_2 = "RuntimeError: CUDA out of memory"
 VLLM_OOM_ERROR = "ValueError: No available memory for the cache blocks"
 
 
@@ -183,10 +184,67 @@ def get_error_type(log_path: str):
         text = f.read()
     if OOM_ERROR in text:
         return OOM_ERROR
+    elif OOM_ERROR_2 in text:
+        return OOM_ERROR
     elif VLLM_OOM_ERROR in text:
         return VLLM_OOM_ERROR
     else:
         return None
+
+
+def _as_int(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _preserve_effective_batch(cmd: str, old_bs: int, new_bs: int, max_accum: int = 16) -> str:
+    """
+    If we reduce per-device batch size to avoid OOM, try to increase gradient_accumulation_steps
+    to preserve effective batch size (better optimization stability).
+    """
+    if old_bs <= 0 or new_bs <= 0 or new_bs >= old_bs:
+        return cmd
+    old_accum = _as_int(extract_value_from_cmd(cmd, "gradient_accumulation_steps")) or 1
+    target = old_bs * old_accum
+    # ceil(target / new_bs)
+    new_accum = int((target + new_bs - 1) // new_bs)
+    new_accum = max(1, min(max_accum, new_accum))
+    if new_accum != old_accum:
+        print(
+            f"Adjusting gradient_accumulation_steps from {old_accum} to {new_accum} to preserve effective batch",
+            flush=True,
+        )
+        cmd = replace_args_in_cmd(cmd, "gradient_accumulation_steps", str(new_accum))
+    return cmd
+
+
+def _try_enable_gradient_checkpointing(cmd: str) -> str:
+    gc = extract_value_from_cmd(cmd, "gradient_checkpointing")
+    if gc is None:
+        return cmd
+    if str(gc).lower() in ("false", "0", "no"):
+        print("Enabling gradient_checkpointing=True to reduce memory usage", flush=True)
+        return replace_args_in_cmd(cmd, "gradient_checkpointing", "True")
+    return cmd
+
+
+def _try_reduce_vllm_util(cmd: str, floor: float = 0.25, step: float = 0.05) -> str:
+    cur = extract_value_from_cmd(cmd, "vllm_gpu_memory_utilization")
+    try:
+        cur_f = float(cur) if cur is not None else None
+    except Exception:
+        cur_f = None
+    if cur_f is None:
+        return cmd
+    new_f = max(floor, cur_f - step)
+    if new_f < cur_f:
+        print(f"Reducing vllm_gpu_memory_utilization from {cur_f} to {new_f}", flush=True)
+        return replace_args_in_cmd(cmd, "vllm_gpu_memory_utilization", str(new_f))
+    return cmd
 
 
 def run_training(
@@ -211,8 +269,8 @@ def run_training(
                     current_batch_size = extract_value_from_cmd(
                         train_cmd, "per_device_train_batch_size"
                     )
-                    if current_batch_size is not None:
-                        current_batch_size_i = int(float(current_batch_size))
+                    current_batch_size_i = _as_int(current_batch_size)
+                    if current_batch_size_i is not None:
                         if current_batch_size_i > 1:
                             new_batch_size = max(1, current_batch_size_i // 2)
                             print(
@@ -224,16 +282,33 @@ def run_training(
                                 "per_device_train_batch_size",
                                 str(new_batch_size),
                             )
+                            train_cmd = _preserve_effective_batch(
+                                train_cmd, current_batch_size_i, new_batch_size
+                            )
+                            train_cmd = _try_enable_gradient_checkpointing(train_cmd)
                         else:
                             print("batch size is 1, cannot reduce further", flush=True)
                             if task_type == TaskType.GRPOTASK.value:
                                 train_cmd = replace_args_in_cmd(
                                     train_cmd, "use_vllm", "False"
                                 )
+                            train_cmd = _try_enable_gradient_checkpointing(train_cmd)
                 elif error_type == VLLM_OOM_ERROR:
                     if task_type == TaskType.GRPOTASK.value:
-                        print(f"VLLM OOM error, disable VLLM", flush=True)
-                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                        # First try reducing vLLM cache pressure; if it still fails on next retry, we'll disable vLLM.
+                        train_cmd = _try_reduce_vllm_util(train_cmd)
+                        print(f"VLLM OOM error, disable VLLM on next fallback if needed", flush=True)
+                        # If utilization is already near floor, disable vLLM now.
+                        use_vllm = extract_value_from_cmd(train_cmd, "use_vllm")
+                        if use_vllm is None or str(use_vllm).lower() not in ("false", "0", "no"):
+                            util = extract_value_from_cmd(train_cmd, "vllm_gpu_memory_utilization")
+                            try:
+                                util_f = float(util) if util is not None else 1.0
+                            except Exception:
+                                util_f = 1.0
+                            if util_f <= 0.26:
+                                print("vLLM utilization already low; disabling vLLM", flush=True)
+                                train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
 
         # empty the log file if it exists
         if os.path.exists(log_path):
@@ -244,6 +319,10 @@ def run_training(
             "WANDB_MODE": "offline",
             "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
             "WANDB_NAME": f"{task_id}_{expected_repo_name}",
+            # Helps reduce allocator fragmentation-related OOMs.
+            "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
+                "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+            ),
         }
 
         rc = run_cmd_with_log(train_cmd, log_path, env_vars=training_env_vars)
