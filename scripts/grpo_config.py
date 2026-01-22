@@ -288,6 +288,9 @@ def get_training_json(train_info: dict) -> dict:
     train_request["min_steps"] = 100
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
+    # Enable the same LR-sweep/checking mechanism used by Instruct/DPO.
+    # GRPO steps are typically slower, so keep this modest.
+    train_request.setdefault("checking_step", 50)
 
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12

@@ -28,7 +28,13 @@ import traceback
 from transformers import TrainerCallback
 import argparse
 import math
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from customized_trainer import (
+    resize_if_needed,
+    set_generation_config,
+    GRPOCustomEvalSaveCallback,
+    WhenToEvalHandler,
+    init_wandb,
+)
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 import os
 import glob
@@ -48,7 +54,7 @@ import bitsandbytes as bnb
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml
 from tokenize_grpo import get_dataset
-from customized_trainer import resize_if_needed, set_generation_config, CustomEvalSaveCallback, WhenToEvalHandler, init_wandb
+from state_manager import get_state, set_state
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 GRPO_DEFAULT_NUM_GENERATIONS = 2
@@ -450,10 +456,32 @@ def main():
     max_steps = train_request.get("max_steps", -1)
     log_info(f"max_steps: {max_steps}")
 
+    # Track when the actual training loop begins (used by checking_step time estimator in callback)
+    start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    state = get_state()
+    state.setdefault("train", {})
+    state["train"]["start_train_time"] = start_time
+    if is_main_process(LOCAL_RANK):
+        set_state(state)
+
     has_extra_column = STANDARD_GRPO_EXTRA_COLUMN in train_ds.column_names
 
     sample_data = dev_ds.to_list()[:10] if len(dev_ds) > 10 else None
     wrapped_reward_funcs = get_reward_funcs(train_request["dataset_type"], sample_data, has_extra_column)
+
+    # Success marker used by outer orchestration (`text_trainer.py`)
+    success_file = os.path.join(training_args.output_dir, "success.txt")
+    if is_main_process(LOCAL_RANK) and os.path.exists(success_file):
+        os.remove(success_file)
+
+    total_steps_all_epochs = int(total_steps_per_epoch * training_args.num_train_epochs)
+
+    checking_step = int(train_request.get("checking_step", 50))
+    if total_steps_per_epoch <= 3:
+        # Too few steps to make checking meaningful; disable.
+        checking_step = -1
+    elif checking_step >= total_steps_per_epoch:
+        checking_step = max(2, total_steps_per_epoch - 2)
     
     trainer = GRPOTrainer(
         model=model,
@@ -464,12 +492,22 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
         callbacks=[
-            CustomEvalSaveCallback(
-                WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
+            GRPOCustomEvalSaveCallback(
+                WhenToEvalHandler(
+                    train_request["end_time"],
+                    train_request["save_before_remaining_time"],
+                    periodic_save_steps=periodic_save_steps,
+                    steps_per_epoch=total_steps_per_epoch,
+                    max_steps=max_steps,
+                ),
                 train_request["submission_dir"],
                 training_args.output_dir,
                 train_request["model_name"],
-                max_steps
+                max_steps,
+                checking_step=checking_step if checking_step > 0 else 1000000000,
+                total_steps_all_epochs=total_steps_all_epochs,
+                end_time=train_request["end_time"],
+                checking_mode=train_request.get("checking_mode", "none"),
             )
         ],
     )

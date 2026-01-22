@@ -556,50 +556,56 @@ def main():
         c_train_info = copy.deepcopy(train_info)
         final_output_dir = None
         resume_from_checkpoint = None
-        if args.task_type == TaskType.GRPOTASK.value:
-            # GRPO: run exactly once (no LR sweep / checking loop)
-            state["mode"] = "finish"
-            c_train_info["train_request"]["checking_mode"] = "none"
-        else:
-            if state["mode"] == "initial":
-                c_train_info["train_request"]["checking_mode"] = "first_time"
-                
-            elif state["mode"] == "continue":
-                c_train_info["train_request"]["checking_mode"] = "second_time"
-                n_runs = int(state.get("next_runs", 0))
-                if n_runs <= 0:
-                    raise RuntimeError("State is 'continue' but missing/invalid 'next_runs'.")
-                if "lrs" not in state: # first time of continue
-                    current_lr = float(state["train"]["lr"])
-                    state["lrs"] = lr_utils.extend_learning_rates(current_lr, n_runs, log_range=get_log_scale(args.task_type))
-                    assert len(state["lrs"]) == n_runs, f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
-                    state["runs"] = []
-                
-                set_state(state)
-                state["runs"].append(state["train"].copy())
-                delete_poor_checkpoints(state["runs"])
-                if len(state["runs"]) < n_runs:
-                    index = len(state["runs"])
-                    current_lr = state["lrs"][index]
-                    train_cmd = replace_args_in_cmd(train_cmd, "learning_rate", str(state["lrs"][index]))
-                else: # the final run
-                    # first find from runs the best loss
-                    c_train_info["train_request"]["checking_mode"] = "none"
-                    # Be robust to missing loss signals.
-                    def _loss_key(run: dict) -> float:
-                        v = run.get("current_loss")
-                        return float(v) if v is not None else float("inf")
-                    best_run = min(state["runs"], key=_loss_key)
-                    index = state["runs"].index(best_run)
-                    print(f"BL;{index};{best_run.get('current_loss')}; {state['lrs'][index]}", flush=True)
-                    train_cmd = best_run["train_cmd"]
-                    final_output_dir = best_run["output_dir"]
-                    # Resume from the warmup checkpoint to avoid redoing the first checking_step steps.
-                    resume_from_checkpoint = best_run.get("checkpoint_dir", None)
-                    state["mode"] = "finish"
-            else: # the state = finish; no need to run more
-                assert state["mode"] == "finish"
-                break
+        if state["mode"] == "initial":
+            c_train_info["train_request"]["checking_mode"] = "first_time"
+
+        elif state["mode"] == "continue":
+            c_train_info["train_request"]["checking_mode"] = "second_time"
+            n_runs = int(state.get("next_runs", 0))
+            if n_runs <= 0:
+                raise RuntimeError("State is 'continue' but missing/invalid 'next_runs'.")
+            if "lrs" not in state:  # first time of continue
+                current_lr = float(state["train"]["lr"])
+                state["lrs"] = lr_utils.extend_learning_rates(
+                    current_lr, n_runs, log_range=get_log_scale(args.task_type)
+                )
+                assert len(state["lrs"]) == n_runs, (
+                    f"Number of learning rates {state['lrs']} should be equal to number of runs {n_runs}"
+                )
+                state["runs"] = []
+
+            set_state(state)
+            state["runs"].append(state["train"].copy())
+            delete_poor_checkpoints(state["runs"])
+            if len(state["runs"]) < n_runs:
+                index = len(state["runs"])
+                current_lr = state["lrs"][index]
+                train_cmd = replace_args_in_cmd(
+                    train_cmd, "learning_rate", str(state["lrs"][index])
+                )
+            else:  # the final run
+                # first find from runs the best loss
+                c_train_info["train_request"]["checking_mode"] = "none"
+
+                # Be robust to missing loss signals.
+                def _loss_key(run: dict) -> float:
+                    v = run.get("current_loss")
+                    return float(v) if v is not None else float("inf")
+
+                best_run = min(state["runs"], key=_loss_key)
+                index = state["runs"].index(best_run)
+                print(
+                    f"BL;{index};{best_run.get('current_loss')}; {state['lrs'][index]}",
+                    flush=True,
+                )
+                train_cmd = best_run["train_cmd"]
+                final_output_dir = best_run["output_dir"]
+                # Resume from the warmup checkpoint to avoid redoing the first checking_step steps.
+                resume_from_checkpoint = best_run.get("checkpoint_dir", None)
+                state["mode"] = "finish"
+        else:  # the state = finish; no need to run more
+            assert state["mode"] == "finish"
+            break
         
         set_state(state)
         if train_cmd:
@@ -640,8 +646,6 @@ def main():
                 break 
         
         count += 1
-        if args.task_type == TaskType.GRPOTASK.value:
-            break
 
     if not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
         print(f"Training failed for task {args.task_id}", flush=True)

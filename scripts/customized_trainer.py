@@ -311,18 +311,28 @@ class CustomEvalSaveCallback(TrainerCallback):
 
 class GRPOCustomEvalSaveCallback(CustomEvalSaveCallback):
     def compute_loss(self, state: TrainerState, metrics):
-        eval_loss = None
-        if state.log_history:
+        # For GRPO we want to *maximize* reward, but the base callback assumes "lower is better".
+        # So we return (-eval_reward) as a "loss" to minimize.
+        eval_reward = None
+        try:
+            if metrics and isinstance(metrics, dict):
+                eval_reward = metrics.get("eval_reward", None)
+        except Exception:
+            eval_reward = None
+
+        if eval_reward is None and state.log_history:
             last_log_entry = state.log_history[-1]
-            eval_loss = last_log_entry.get("eval_reward", None)
-            print(f"choose eval_loss ({eval_loss}) as eval_reward from: last_log_entry: {last_log_entry}; \n metrics: {metrics}", flush=True)
-        else:
-            print(f"state.log_history is empty", flush=True)
-            
-        if eval_loss is not None:
-            eval_loss = - eval_loss
-            
-        return eval_loss
+            eval_reward = last_log_entry.get("eval_reward", None)
+            print(
+                f"choose eval_loss ({eval_reward}) as eval_reward from: last_log_entry: {last_log_entry}; \n metrics: {metrics}",
+                flush=True,
+            )
+
+        if eval_reward is None:
+            print("eval_reward missing; treating as worst result for checkpoint selection", flush=True)
+            return float("inf")
+
+        return -float(eval_reward)
     
     def penalize_eval_loss(self, eval_loss: float):
         if eval_loss < 0:
